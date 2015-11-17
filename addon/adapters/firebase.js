@@ -2,25 +2,9 @@ import Ember from 'ember';
 import DS from 'ember-data';
 import toPromise from '../utils/to-promise';
 import forEach from 'lodash/collection/forEach';
-import filter from 'lodash/collection/filter';
-import map from 'lodash/collection/map';
-import includes from 'lodash/collection/includes';
-import indexOf from 'lodash/array/indexOf';
 import find from 'lodash/collection/find';
 
 var Promise = Ember.RSVP.Promise;
-
-var uniq = function (arr) {
-  var ret = Ember.A();
-
-  arr.forEach(function(k) {
-    if (indexOf(ret, k) < 0) {
-      ret.push(k);
-    }
-  });
-
-  return ret;
-};
 
 /**
   The Firebase adapter allows your store to communicate with the Firebase
@@ -62,8 +46,6 @@ export default DS.Adapter.extend(Ember.Evented, {
     this._ref = firebase.ref();
     // Keep track of what types `.findAll()` has been called for
     this._findAllMapForType = {};
-    // Keep a cache to check modified relationships against
-    this._recordCacheForType = {};
     // Used to batch records into the store
     this._queue = [];
   },
@@ -105,7 +87,6 @@ export default DS.Adapter.extend(Ember.Evented, {
     return new Promise(function(resolve, reject) {
       ref.once('value', function(snapshot) {
         var payload = adapter._assignIdToPayload(snapshot);
-        adapter._updateRecordCacheForType(typeClass, payload);
         if (payload === null) {
           var error = new Error(`no record was found at ${ref.toString()}`);
               error.recordId = id;
@@ -200,7 +181,6 @@ export default DS.Adapter.extend(Ember.Evented, {
         var results = [];
         snapshot.forEach(function(childSnapshot) {
           var payload = adapter._assignIdToPayload(childSnapshot);
-          adapter._updateRecordCacheForType(typeClass, payload);
           results.push(payload);
         });
         resolve(results);
@@ -223,7 +203,6 @@ export default DS.Adapter.extend(Ember.Evented, {
       if (!record || !record.__listening) {
         var payload = adapter._assignIdToPayload(snapshot);
         var normalizedData = store.normalize(typeClass.modelName, payload);
-        adapter._updateRecordCacheForType(typeClass, payload);
         record = store.push(normalizedData);
       }
 
@@ -260,7 +239,6 @@ export default DS.Adapter.extend(Ember.Evented, {
         var results = [];
         snapshot.forEach(function(childSnapshot) {
           var payload = adapter._assignIdToPayload(childSnapshot);
-          adapter._updateRecordCacheForType(typeClass, payload);
           results.push(payload);
         });
         resolve(results);
@@ -369,18 +347,14 @@ export default DS.Adapter.extend(Ember.Evented, {
     method on a model record instance.
 
     The `updateRecord` method serializes the record and performs an `update()`
-    at the the Firebase location and a `.set()` at any relationship locations
-    The method will return a promise which will be resolved when the data and
-    any relationships have been successfully saved to Firebase.
+    at the the Firebase location.
 
     We take an optional record reference, in order for this method to be usable
     for saving nested records as well.
 
   */
   updateRecord: function(store, typeClass, snapshot) {
-    var adapter = this;
     var recordRef = this._getAbsoluteRef(snapshot.record);
-    var recordCache = adapter._getRecordCache(typeClass, snapshot.id);
 
     var pathPieces = recordRef.path.toString().split('/');
     var lastPiece = pathPieces[pathPieces.length-1];
@@ -388,121 +362,53 @@ export default DS.Adapter.extend(Ember.Evented, {
       includeId: (lastPiece !== snapshot.id) // record has no firebase `key` in path
     });
 
-    return new Promise(function(resolve, reject) {
-      var savedRelationships = Ember.A();
-      snapshot.record.eachRelationship(function(key, relationship) {
-        var save;
+    return this._updateRecord(recordRef, serializedRecord).then(() => {
+      return this._cleanEmbeddedChildren(store, typeClass, snapshot);
+    }).then(() => {
+      // required, tells ember data that the data we saved is the last known
+      // server state. Equivalent is to return `serializedRecord`.
+      return undefined;
+    });
+
+    // TODO: add promise label:
+    // `DS: FirebaseAdapter#updateRecord ${typeClass} to ${recordRef.toString()}`);
+  },
+
+  /**
+   * Recursively removes the `dirty` state on all embedded children.
+   *
+   * @param  {DS.Store} store
+   * @param  {Class} typeClass
+   * @param  {DS.Snapshot} snapshot
+   * @private
+   */
+  _cleanEmbeddedChildren: function (store, typeClass, snapshot) {
+    var embeddedSnapshots = [];
+    snapshot.eachRelationship((key, relationship) => {
+      if (this.isRelationshipEmbedded(store, typeClass.modelName, relationship)) {
         if (relationship.kind === 'hasMany') {
-          if (serializedRecord[key]) {
-            save = adapter._saveHasManyRelationship(store, typeClass, relationship, serializedRecord[key], recordRef, recordCache);
-            savedRelationships.push(save);
-            // Remove the relationship from the serializedRecord because otherwise we would clobber the entire hasMany
-            delete serializedRecord[key];
-          }
+          snapshot.hasMany(key).forEach(function (childSnapshot) {
+            embeddedSnapshots.push(childSnapshot);
+          });
         } else {
-          if (adapter.isRelationshipEmbedded(store, typeClass.modelName, relationship) && serializedRecord[key]) {
-            save = adapter._saveEmbeddedBelongsToRecord(store, typeClass, relationship, serializedRecord[key], recordRef);
-            savedRelationships.push(save);
-            delete serializedRecord[key];
+          if (snapshot.belongsTo(key)) {
+            embeddedSnapshots.push(snapshot.belongsTo(key));
           }
         }
-      });
+      }
+    });
 
-      var relationshipsPromise = Ember.RSVP.allSettled(savedRelationships);
-      var recordPromise = adapter._updateRecord(recordRef, serializedRecord);
-
-      Ember.RSVP.hashSettled({relationships: relationshipsPromise, record: recordPromise}).then(function(promises) {
-        var rejected = Ember.A(promises.relationships.value).filterBy('state', 'rejected');
-        if (promises.record.state === 'rejected') {
-          rejected.push(promises.record);
-        }
-        // Throw an error if any of the relationships failed to save
-        if (rejected.length !== 0) {
-          var error = new Error(`Some errors were encountered while saving ${typeClass} ${snapshot.id}`);
-          error.errors = Ember.A(rejected).mapBy('reason');
-          reject(error);
-        } else {
-          resolve();
-        }
-      });
-    }, `DS: FirebaseAdapter#updateRecord ${typeClass} to ${recordRef.toString()}`);
+    embeddedSnapshots.forEach((childSnapshot) => {
+      this._cleanEmbeddedChildren(store, childSnapshot.type, childSnapshot);
+      childSnapshot._internalModel.flushChangedAttributes();
+      childSnapshot._internalModel.adapterWillCommit();
+      childSnapshot._internalModel.adapterDidCommit();
+    });
   },
 
   //Just update the record itself without caring for the relationships
   _updateRecord: function(recordRef, serializedRecord) {
     return toPromise(recordRef.update, recordRef, [serializedRecord]);
-  },
-
-  /**
-    Call _saveHasManyRelationshipRecord on each record in the relationship
-    and then resolve once they have all settled
-  */
-  _saveHasManyRelationship: function(store, typeClass, relationship, ids, recordRef, recordCache) {
-    if (!Ember.isArray(ids)) {
-      throw new Error('hasMany relationships must must be an array');
-    }
-    var adapter = this;
-    var idsCache = Ember.A(recordCache[relationship.key]);
-    var dirtyRecords = [];
-
-    // Added
-    var addedRecords = filter(ids, function(id) {
-      return !idsCache.contains(id);
-    });
-
-    // Dirty
-    dirtyRecords = filter(ids, function(id) {
-      var relatedModelName = relationship.type;
-      return store.hasRecordForId(relatedModelName, id) && store.peekRecord(relatedModelName, id).get('hasDirtyAttributes') === true;
-    });
-
-    dirtyRecords = map(uniq(dirtyRecords.concat(addedRecords)), function(id) {
-      return adapter._saveHasManyRecord(store, typeClass, relationship, recordRef, id);
-    });
-
-    // Removed
-    var removedRecords = filter(idsCache, function(id) {
-      return !includes(ids, id);
-    });
-
-    removedRecords = map(removedRecords, function(id) {
-      return adapter._removeHasManyRecord(store, recordRef, relationship.key, id);
-    });
-    // Combine all the saved records
-    var savedRecords = dirtyRecords.concat(removedRecords);
-    // Wait for all the updates to finish
-    return Ember.RSVP.allSettled(savedRecords).then(function(savedRecords) {
-      var rejected = Ember.A(Ember.A(savedRecords).filterBy('state', 'rejected'));
-      if (rejected.get('length') === 0) {
-        // Update the cache
-        recordCache[relationship.key] = ids;
-        return savedRecords;
-      }
-      else {
-        var error = new Error(`Some errors were encountered while saving a hasMany relationship ${relationship.parentType} -> ${relationship.type}`);
-            error.errors = Ember.A(rejected).mapBy('reason');
-        throw error;
-      }
-    });
-  },
-
-  /**
-    If the relationship is `async: true`, create a child ref
-    named with the record id and set the value to true
-
-    If the relationship is `embedded: true`, create a child ref
-    named with the record id and update the value to the serialized
-    version of the record
-  */
-  _saveHasManyRecord: function(store, typeClass, relationship, parentRef, id) {
-    var ref = this._getRelationshipRef(parentRef, relationship.key, id);
-    var record = store.peekRecord(relationship.type, id);
-    var isEmbedded = this.isRelationshipEmbedded(store, typeClass.modelName, relationship);
-    if (isEmbedded) {
-      return record.save();
-    }
-
-    return toPromise(ref.set, ref,  [true]);
   },
 
   /**
@@ -537,19 +443,6 @@ export default DS.Adapter.extend(Ember.Evented, {
   _removeHasManyRecord: function(store, parentRef, key, id) {
     var ref = this._getRelationshipRef(parentRef, key, id);
     return toPromise(ref.remove, ref, [], ref.toString());
-  },
-
-  /**
-   * Save an embedded belongsTo record and set its internal firebase ref
-   *
-   * @return {Promise<DS.Model>}
-   */
-  _saveEmbeddedBelongsToRecord: function(store, typeClass, relationship, id, parentRef) {
-    var record = store.peekRecord(relationship.type, id);
-    if (record) {
-      return record.save();
-    }
-    return Ember.RSVP.Promise.reject(new Error(`Unable to find record with id ${id} from embedded relationship: ${JSON.stringify(relationship)}`));
   },
 
   /**
@@ -680,39 +573,6 @@ export default DS.Adapter.extend(Ember.Evented, {
     } else {
       callback.apply(null, args);
     }
-  },
-
-  /**
-    A cache of hasMany relationships that can be used to
-    diff against new relationships when a model is saved
-  */
-  _recordCacheForType: undefined,
-
-  /**
-    _updateHasManyCacheForType
-  */
-  _updateRecordCacheForType: function(typeClass, payload) {
-    if (!payload) { return; }
-    var id = payload.id;
-    var cache = this._getRecordCache(typeClass, id);
-    // Only cache relationships for now
-    typeClass.eachRelationship(function(key, relationship) {
-      if (relationship.kind === 'hasMany') {
-        var ids = payload[key];
-        cache[key] = !Ember.isNone(ids) ? Ember.A(Object.keys(ids)) : Ember.A();
-      }
-    });
-  },
-
-  /**
-    Get or create the cache for a record
-   */
-  _getRecordCache: function (typeClass, id) {
-    var modelName = typeClass.modelName;
-    var cache = this._recordCacheForType;
-    cache[modelName] = cache[modelName] || {};
-    cache[modelName][id] = cache[modelName][id] || {};
-    return cache[modelName][id];
   },
 
   /**
